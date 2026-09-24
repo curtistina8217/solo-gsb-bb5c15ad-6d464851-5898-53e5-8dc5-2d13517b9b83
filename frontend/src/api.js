@@ -9,8 +9,22 @@ async function request(path, options = {}) {
     let detail = `${res.status} ${res.statusText}`
     try {
       const body = await res.json()
-      if (body.detail) detail = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail)
-    } catch { /* ignore */ }
+      if (body.detail) {
+        if (typeof body.detail === 'string') {
+          detail = body.detail
+        } else {
+          // 结构化错误（如迁移过期）：优先展示其中的 message，并保留原始
+          // detail 供调用方按 code / reasons 做程序化处理
+          detail = body.detail.message || JSON.stringify(body.detail)
+          const err = new Error(detail)
+          err.detail = body.detail
+          throw err
+        }
+      }
+    } catch (e) {
+      if (e && e.detail) throw e
+      /* 响应体不是 JSON：保留 HTTP 状态行作为错误信息 */
+    }
     throw new Error(detail)
   }
   if (res.status === 204) return null

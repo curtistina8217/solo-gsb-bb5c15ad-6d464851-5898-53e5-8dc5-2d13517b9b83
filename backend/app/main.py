@@ -115,9 +115,10 @@ class MigrationDecision(BaseModel):
 
 
 class MigrationCommitRequest(BaseModel):
-    """文档版本迁移确认：原文指纹 + 新正文 + 待确认项决策。"""
+    """文档版本迁移确认：正文指纹 + 标注集合指纹 + 新正文 + 待确认项决策。"""
 
     old_fingerprint: str = Field(min_length=1)
+    codings_fingerprint: str = Field(min_length=1)
     new_content: str = Field(min_length=1)
     decisions: list[MigrationDecision] = Field(default_factory=list)
 
@@ -600,12 +601,17 @@ def import_confirm(document_id: int, body: AnnotationPackage) -> dict:
 
 
 def prepare_migration(conn, document_id: int, new_content: str) -> tuple[dict, dict]:
-    """在当前连接快照上构建迁移预览，返回 (doc, preview)。"""
+    """在当前连接快照上构建迁移预览，返回 (doc, preview)。
+
+    预览同时锁定当前正文内容指纹与标注集合指纹，确认端在同一事务内
+    重算并核对，防止预览后标注被新增 / 删除 / 修改却仍按陈旧预览提交。
+    """
     doc = get_document_or_404(conn, document_id)
-    fingerprint = content_fingerprint(doc["content"])
+    content_fp = content_fingerprint(doc["content"])
     codings = list_codings(conn, document_id)
+    codings_fp = codings_fingerprint(codings)
     preview = build_migration_preview(
-        document_id, doc["content"], new_content, codings, fingerprint
+        document_id, doc["content"], new_content, codings, content_fp, codings_fp
     )
     return doc, preview
 
@@ -616,7 +622,8 @@ def migration_preview(document_id: int, body: MigrationPreviewRequest) -> dict:
 
     对新正文与当前正文做字符级差异对齐，逐条把旧标注分类为保留（唯一匹配
     自动定位）/ 待确认（多重匹配、内容改动、文本删除，附新旧上下文）/ 失配
-    （被替换，确认时丢弃），并返回原文内容指纹供确认时校验版本。
+    （被替换，确认时丢弃），并返回预览时刻的原文内容指纹与标注集合指纹，
+    供确认时在同一事务内核对版本。
     """
     with get_db() as conn:
         _, preview = prepare_migration(conn, document_id, body.new_content)
@@ -625,29 +632,57 @@ def migration_preview(document_id: int, body: MigrationPreviewRequest) -> dict:
 
 @app.post("/api/documents/{document_id}/migration/commit")
 def migration_commit(document_id: int, body: MigrationCommitRequest) -> dict:
-    """确认迁移：校验原文版本，在单事务中更新正文与全部标注。
+    """确认迁移：核对正文与标注快照，在单事务中更新正文与全部标注。
 
     先重跑差异对齐并在事务内完成全部校验：
-      - 原文内容指纹不一致（正文已被其它操作改动）→ 422，整批回滚；
+      - 原文内容指纹或标注集合指纹与预览快照不一致（预检后正文或标注已被
+        其它操作改动）→ 422 过期错误，区分 document_changed / codings_changed
+        原因，整批回滚、正文与标注均不写入，需重新生成迁移预览；
       - 待确认项缺少决策 / 存在未知标注 id / remap 缺少区间或区间非法
         （end <= start 或超出新正文长度）→ 422，整批回滚。
     任一校验失败均不落库；通过后：保留项与 remap 项更新区间（保留原 id），
-    用户放弃项与失配项删除，正文更新为新版本。
+    用户放弃项与失配项删除，正文更新为新版本（原子提交）。
     """
     with get_db() as conn:
         doc, preview = prepare_migration(conn, document_id, body.new_content)
 
-        blockers: list[dict] = []
-        current_fp = content_fingerprint(doc["content"])
-        if body.old_fingerprint != current_fp:
+        # 快照核对先于决策校验：正文 / 标注任一相对预览发生变化即过期，
+        # 此时旧预览中的候选与决策不再可信，直接拒绝并要求重新预览
+        current_content_fp = content_fingerprint(doc["content"])
+        current_codings_fp = codings_fingerprint(list_codings(conn, document_id))
+        stale_reasons: list[str] = []
+        if body.old_fingerprint != current_content_fp:
+            stale_reasons.append("document_changed")
+        if body.codings_fingerprint != current_codings_fp:
+            stale_reasons.append("codings_changed")
+        if stale_reasons:
+            if len(stale_reasons) == 2:
+                message = (
+                    "迁移预览已过期：预检后文档正文与标注集合均已变化，"
+                    "请重新生成迁移预览后再确认"
+                )
+            elif stale_reasons[0] == "document_changed":
+                message = (
+                    "迁移预览已过期：预检后文档正文已被修改，"
+                    "请重新生成迁移预览后再确认"
+                )
+            else:
+                message = (
+                    "迁移预览已过期：预检后标注已被新增、删除或修改，"
+                    "请重新生成迁移预览后再确认"
+                )
             raise HTTPException(
                 status_code=422,
                 detail={
-                    "message": "原文版本校验失败：文档在预检后已被修改，请重新生成迁移预览",
-                    "expected": current_fp,
+                    "code": "migration_preview_stale",
+                    "message": message,
+                    "reasons": stale_reasons,
+                    "expected_content_fingerprint": current_content_fp,
+                    "expected_codings_fingerprint": current_codings_fp,
                 },
             )
 
+        blockers: list[dict] = []
         items_by_id = {it["coding_id"]: it for it in preview["items"]}
         pending_ids = {
             it["coding_id"] for it in preview["items"] if it["status"] in PENDING_STATUSES

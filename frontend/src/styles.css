@@ -1741,6 +1741,34 @@ textarea:focus {
   width: min(960px, 96vw);
 }
 
+.migration-stale {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 8px 0;
+}
+
+.mig-stale-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: flex-start;
+  border: 1px solid #fecaca;
+}
+
+.mig-stale-reasons {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.mig-stale-reasons .tag {
+  font-size: 12.5px;
+}
+
 .migration-input {
   display: flex;
   flex-direction: column;

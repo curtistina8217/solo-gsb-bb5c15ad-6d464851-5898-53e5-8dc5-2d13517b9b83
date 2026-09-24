@@ -12,7 +12,7 @@
 
 其中 kept 为「保留」；ambiguous / modified / deleted 为「待确认」；
 mismatch 为「失配」。调用方在单事务内重跑本预览并据用户决策更新正文与标注，
-任一校验失败整体回滚。
+事务内同时核对预览时锁定的正文指纹与标注集合指纹，任一校验失败整体回滚。
 """
 
 from __future__ import annotations
@@ -238,9 +238,16 @@ def build_migration_preview(
     old_content: str,
     new_content: str,
     codings: list[dict],
-    fingerprint: str,
+    content_fp: str,
+    codings_fp: str,
 ) -> dict:
-    """构建整篇文档的迁移预览：逐条分类并汇总保留 / 待确认 / 失配计数。"""
+    """构建整篇文档的迁移预览：逐条分类并汇总保留 / 待确认 / 失配计数。
+
+    同时锁定预览时刻的正文内容指纹（content_fp）与标注集合指纹
+    （codings_fp）并原样回传；确认端在同一事务内重算这两个指纹，任一
+    与预览快照不符即判为过期、拒绝写入，避免用户按陈旧预览确认导致
+    未审阅的新增 / 删除 / 修改标注被迁移或丢弃。
+    """
     if new_content == old_content:
         items = [_identical_item(c, old_content) for c in codings]
     else:
@@ -259,7 +266,8 @@ def build_migration_preview(
         "document_id": document_id,
         "old_length": len(old_content),
         "new_length": len(new_content),
-        "old_fingerprint": fingerprint,
+        "old_fingerprint": content_fp,
+        "codings_fingerprint": codings_fp,
         "summary": summary,
         "items": items,
     }

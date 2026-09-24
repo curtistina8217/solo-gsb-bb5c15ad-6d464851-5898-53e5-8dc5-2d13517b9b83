@@ -12,7 +12,9 @@ import TextView from './TextView'
  *             - 失配（被替换，确认迁移时自动丢弃）。
  *           所有待确认项处理完才能确认；
  *   done    阶段展示迁移结果。
- * 确认时后端校验原文版本并在单事务中更新正文与全部标注，任一校验失败不落库；
+ * 确认请求携带预览时锁定的正文指纹与标注集合指纹；后端在同一事务内核对，
+ * 预览后正文或标注发生变化会返回过期错误（422，migration_preview_stale），
+ * 此时不写入并展示过期提示、引导重新生成预览；其余校验失败仍可调整后重试。
  * 取消 / 关闭不产生任何写入。
  */
 export default function MigrationDialog({ docId, oldContent, onClose, onMigrated }) {
@@ -24,6 +26,8 @@ export default function MigrationDialog({ docId, oldContent, onClose, onMigrated
   const [pickingId, setPickingId] = useState(null) // 正在新正文中拖选手选的待确认项
   const [flashRange, setFlashRange] = useState(null)
   const [result, setResult] = useState(null)
+  // 预览过期快照：{ message, reasons }（reasons 含 document_changed / codings_changed）
+  const [stale, setStale] = useState(null)
   const paneRef = useRef(null)
 
   const newLength = newContent.length
@@ -66,13 +70,14 @@ export default function MigrationDialog({ docId, oldContent, onClose, onMigrated
     [pendingItems, decisions]
   )
 
-  async function handlePreview() {
+  async function runPreview() {
     if (!newContent) {
       setError('新正文不能为空')
       return
     }
     setPhase('busy')
     setError(null)
+    setStale(null)
     try {
       const data = await api.previewMigration(docId, newContent)
       setPreview(data)
@@ -97,9 +102,10 @@ export default function MigrationDialog({ docId, oldContent, onClose, onMigrated
   }
 
   async function handleCommit() {
-    if (!preview || unresolved.length > 0) return
+    if (!preview || unresolved.length > 0 || stale) return
     const payload = {
       old_fingerprint: preview.old_fingerprint,
+      codings_fingerprint: preview.codings_fingerprint,
       new_content: newContent,
       decisions: pendingItems.map((it) => {
         const d = decisions[it.coding_id]
@@ -122,8 +128,17 @@ export default function MigrationDialog({ docId, oldContent, onClose, onMigrated
       setPhase('done')
       await onMigrated()
     } catch (e) {
-      setError(e.message || String(e))
-      setPhase('preview')
+      // 快照过期（正文 / 标注在预览后被改动）：旧预览不可再提交，
+      // 展示过期提示并引导重新生成预览；其余错误仍允许用户调整后重试
+      if (e.detail && e.detail.code === 'migration_preview_stale') {
+        setStale({ message: e.message, reasons: e.detail.reasons || [] })
+        setError(null)
+        setPickingId(null)
+        setPhase('preview')
+      } else {
+        setError(e.message || String(e))
+        setPhase('preview')
+      }
     }
   }
 
@@ -227,7 +242,11 @@ export default function MigrationDialog({ docId, oldContent, onClose, onMigrated
             {phase === 'busy' && <div className="empty">正在比对文本差异…</div>}
             {phase === 'committing' && <div className="empty">正在执行迁移…</div>}
 
-            {(phase === 'preview' || phase === 'committing') && preview && (
+            {(phase === 'preview' || phase === 'committing') && preview && stale && (
+              <StalePanel stale={stale} onRepreview={runPreview} />
+            )}
+
+            {(phase === 'preview' || phase === 'committing') && preview && !stale && (
               <PreviewBody
                 preview={preview}
                 items={preview.items}
@@ -252,8 +271,14 @@ export default function MigrationDialog({ docId, oldContent, onClose, onMigrated
             )}
 
             <div className="modal-actions">
-              {phase === 'preview' && (
-                <button className="link-btn" onClick={() => setPhase('input')}>
+              {phase === 'preview' && !stale && (
+                <button
+                  className="link-btn"
+                  onClick={() => {
+                    setStale(null)
+                    setPhase('input')
+                  }}
+                >
                   返回编辑新正文
                 </button>
               )}
@@ -263,11 +288,16 @@ export default function MigrationDialog({ docId, oldContent, onClose, onMigrated
                 </button>
               )}
               {phase === 'input' && (
-                <button className="primary-btn" onClick={handlePreview}>
+                <button className="primary-btn" onClick={runPreview}>
                   生成迁移预览
                 </button>
               )}
-              {phase === 'preview' && (
+              {phase === 'preview' && stale && (
+                <button className="primary-btn" onClick={runPreview}>
+                  重新生成迁移预览
+                </button>
+              )}
+              {phase === 'preview' && !stale && (
                 <button
                   className="primary-btn"
                   onClick={handleCommit}
@@ -599,6 +629,38 @@ function PendingSection({ pending, ambiguous, modified, deleted, rowPropsFor }) 
         ))}
       </ul>
     </details>
+  )
+}
+
+const STALE_REASON_LABELS = {
+  document_changed: '文档正文已变化',
+  codings_changed: '标注集合已变化（新增 / 删除 / 修改）',
+}
+
+function StalePanel({ stale, onRepreview }) {
+  return (
+    <div className="migration-stale">
+      <div className="error-banner import-error mig-stale-banner">
+        <strong>迁移预览已过期</strong>
+        <span>{stale.message}</span>
+      </div>
+      <ul className="mig-stale-reasons">
+        {stale.reasons.map((r) => (
+          <li key={r} className="tag tag-invalid">
+            {STALE_REASON_LABELS[r] || r}
+          </li>
+        ))}
+      </ul>
+      <p className="hint">
+        本次预览未写入任何内容，已填写的决策不会生效。请点击下方按钮按最新的
+        正文与标注重新生成预览，再核对迁移明细并确认。
+      </p>
+      <div className="modal-actions">
+        <button className="primary-btn" onClick={onRepreview}>
+          重新生成迁移预览
+        </button>
+      </div>
+    </div>
   )
 }
 
