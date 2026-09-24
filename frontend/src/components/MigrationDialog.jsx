@@ -12,13 +12,16 @@ import TextView from './TextView'
  *             - 失配（被替换，确认迁移时自动丢弃）。
  *           所有待确认项处理完才能确认；
  *   done    阶段展示迁移结果。
- * 确认时后端校验原文版本并在单事务中更新正文与全部标注，任一校验失败不落库；
+ * 确认时后端在同一事务内核对预检返回的正文指纹与标注集合指纹：任一变化
+ * （正文被编辑，或标注被新增 / 删除 / 修改）即返回过期错误且不写入任何内容，
+ * 前端引导重新生成预览；指纹一致才校验决策并在单事务中更新正文与全部标注；
  * 取消 / 关闭不产生任何写入。
  */
 export default function MigrationDialog({ docId, oldContent, onClose, onMigrated }) {
   const [newContent, setNewContent] = useState(oldContent)
   const [phase, setPhase] = useState('input') // input | busy | preview | committing | done
   const [error, setError] = useState(null)
+  const [staleMessage, setStaleMessage] = useState(null) // 确认时预览已过期（409）
   const [preview, setPreview] = useState(null)
   const [decisions, setDecisions] = useState({}) // {codingId: {kind, start, end}}
   const [pickingId, setPickingId] = useState(null) // 正在新正文中拖选手选的待确认项
@@ -73,6 +76,7 @@ export default function MigrationDialog({ docId, oldContent, onClose, onMigrated
     }
     setPhase('busy')
     setError(null)
+    setStaleMessage(null)
     try {
       const data = await api.previewMigration(docId, newContent)
       setPreview(data)
@@ -97,9 +101,10 @@ export default function MigrationDialog({ docId, oldContent, onClose, onMigrated
   }
 
   async function handleCommit() {
-    if (!preview || unresolved.length > 0) return
+    if (!preview || unresolved.length > 0 || staleMessage) return
     const payload = {
       old_fingerprint: preview.old_fingerprint,
+      old_codings_fingerprint: preview.old_codings_fingerprint,
       new_content: newContent,
       decisions: pendingItems.map((it) => {
         const d = decisions[it.coding_id]
@@ -122,7 +127,15 @@ export default function MigrationDialog({ docId, oldContent, onClose, onMigrated
       setPhase('done')
       await onMigrated()
     } catch (e) {
-      setError(e.message || String(e))
+      if (e.status === 409) {
+        // 预览已过期：预检后正文或标注被改动，后端未写入任何内容，引导重新预览
+        setStaleMessage(
+          e.detail?.message ||
+            '迁移预览已过期：文档正文或标注在预检后已变化，未写入任何内容，请重新生成迁移预览'
+        )
+      } else {
+        setError(e.message || String(e))
+      }
       setPhase('preview')
     }
   }
@@ -247,7 +260,16 @@ export default function MigrationDialog({ docId, oldContent, onClose, onMigrated
               />
             )}
 
-            {phase === 'preview' && error && (
+            {phase === 'preview' && staleMessage && (
+              <div className="error-banner import-error migration-stale">
+                <p>{staleMessage}</p>
+                <button className="primary-btn" onClick={handlePreview}>
+                  重新生成迁移预览
+                </button>
+              </div>
+            )}
+
+            {phase === 'preview' && !staleMessage && error && (
               <div className="error-banner import-error">{error}</div>
             )}
 
@@ -271,8 +293,14 @@ export default function MigrationDialog({ docId, oldContent, onClose, onMigrated
                 <button
                   className="primary-btn"
                   onClick={handleCommit}
-                  disabled={unresolved.length > 0}
-                  title={unresolved.length > 0 ? '仍有待确认项未处理' : undefined}
+                  disabled={unresolved.length > 0 || !!staleMessage}
+                  title={
+                    staleMessage
+                      ? '预览已过期，请重新生成迁移预览'
+                      : unresolved.length > 0
+                        ? '仍有待确认项未处理'
+                        : undefined
+                  }
                 >
                   {unresolved.length > 0
                     ? `确认迁移（${unresolved.length} 项待确认）`

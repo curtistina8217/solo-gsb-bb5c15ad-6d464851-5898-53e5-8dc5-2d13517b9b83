@@ -11,7 +11,8 @@
   mismatch   区间位置被实质的新文本占据：无法可靠映射，列为失配，确认时丢弃。
 
 其中 kept 为「保留」；ambiguous / modified / deleted 为「待确认」；
-mismatch 为「失配」。调用方在单事务内重跑本预览并据用户决策更新正文与标注，
+mismatch 为「失配」。调用方在单事务内重跑本预览，先核对正文与标注集合
+双指纹（预检后任一变化即整体放弃），再据用户决策更新正文与标注，
 任一校验失败整体回滚。
 """
 
@@ -239,8 +240,13 @@ def build_migration_preview(
     new_content: str,
     codings: list[dict],
     fingerprint: str,
+    codings_fingerprint: str,
 ) -> dict:
-    """构建整篇文档的迁移预览：逐条分类并汇总保留 / 待确认 / 失配计数。"""
+    """构建整篇文档的迁移预览：逐条分类并汇总保留 / 待确认 / 失配计数。
+
+    同时回传正文内容指纹与标注集合指纹，确认迁移时据此核对预检后
+    正文与标注是否被其它操作改动。
+    """
     if new_content == old_content:
         items = [_identical_item(c, old_content) for c in codings]
     else:
@@ -260,6 +266,7 @@ def build_migration_preview(
         "old_length": len(old_content),
         "new_length": len(new_content),
         "old_fingerprint": fingerprint,
+        "old_codings_fingerprint": codings_fingerprint,
         "summary": summary,
         "items": items,
     }

@@ -1741,6 +1741,18 @@ textarea:focus {
   width: min(960px, 96vw);
 }
 
+.migration-stale {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.migration-stale p {
+  margin: 0;
+  line-height: 1.6;
+}
+
 .migration-input {
   display: flex;
   flex-direction: column;

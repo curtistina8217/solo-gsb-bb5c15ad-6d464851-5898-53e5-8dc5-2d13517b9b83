@@ -7,11 +7,17 @@ async function request(path, options = {}) {
   })
   if (!res.ok) {
     let detail = `${res.status} ${res.statusText}`
+    let payload = null
     try {
       const body = await res.json()
+      payload = body.detail ?? null
       if (body.detail) detail = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail)
     } catch { /* ignore */ }
-    throw new Error(detail)
+    // 附带状态码与结构化 detail，便于调用方区分过期（409）等特定错误
+    const err = new Error(detail)
+    err.status = res.status
+    err.detail = payload
+    throw err
   }
   if (res.status === 204) return null
   return res.json()

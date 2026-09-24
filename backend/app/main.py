@@ -115,9 +115,10 @@ class MigrationDecision(BaseModel):
 
 
 class MigrationCommitRequest(BaseModel):
-    """文档版本迁移确认：原文指纹 + 新正文 + 待确认项决策。"""
+    """文档版本迁移确认：原文指纹 + 标注集合指纹 + 新正文 + 待确认项决策。"""
 
     old_fingerprint: str = Field(min_length=1)
+    old_codings_fingerprint: str = Field(min_length=1)
     new_content: str = Field(min_length=1)
     decisions: list[MigrationDecision] = Field(default_factory=list)
 
@@ -605,7 +606,12 @@ def prepare_migration(conn, document_id: int, new_content: str) -> tuple[dict, d
     fingerprint = content_fingerprint(doc["content"])
     codings = list_codings(conn, document_id)
     preview = build_migration_preview(
-        document_id, doc["content"], new_content, codings, fingerprint
+        document_id,
+        doc["content"],
+        new_content,
+        codings,
+        fingerprint,
+        codings_fingerprint(codings),
     )
     return doc, preview
 
@@ -616,7 +622,8 @@ def migration_preview(document_id: int, body: MigrationPreviewRequest) -> dict:
 
     对新正文与当前正文做字符级差异对齐，逐条把旧标注分类为保留（唯一匹配
     自动定位）/ 待确认（多重匹配、内容改动、文本删除，附新旧上下文）/ 失配
-    （被替换，确认时丢弃），并返回原文内容指纹供确认时校验版本。
+    （被替换，确认时丢弃），并返回原文内容指纹与标注集合指纹，供确认时
+    核对预检后正文与标注是否被改动。
     """
     with get_db() as conn:
         _, preview = prepare_migration(conn, document_id, body.new_content)
@@ -625,10 +632,12 @@ def migration_preview(document_id: int, body: MigrationPreviewRequest) -> dict:
 
 @app.post("/api/documents/{document_id}/migration/commit")
 def migration_commit(document_id: int, body: MigrationCommitRequest) -> dict:
-    """确认迁移：校验原文版本，在单事务中更新正文与全部标注。
+    """确认迁移：核对正文与标注快照，在单事务中更新正文与全部标注。
 
     先重跑差异对齐并在事务内完成全部校验：
-      - 原文内容指纹不一致（正文已被其它操作改动）→ 422，整批回滚；
+      - 原文内容指纹或标注集合指纹不一致（预检后正文被改动，或有标注被
+        新增 / 删除 / 修改）→ 409 预览已过期，正文与标注均不写入，
+        需重新生成迁移预览；
       - 待确认项缺少决策 / 存在未知标注 id / remap 缺少区间或区间非法
         （end <= start 或超出新正文长度）→ 422，整批回滚。
     任一校验失败均不落库；通过后：保留项与 remap 项更新区间（保留原 id），
@@ -637,17 +646,25 @@ def migration_commit(document_id: int, body: MigrationCommitRequest) -> dict:
     with get_db() as conn:
         doc, preview = prepare_migration(conn, document_id, body.new_content)
 
-        blockers: list[dict] = []
-        current_fp = content_fingerprint(doc["content"])
-        if body.old_fingerprint != current_fp:
+        # 版本核对：正文指纹与标注集合指纹须与预检时一致，任一变化即视为
+        # 预览过期——继续提交会按用户未审阅的标注重算映射，直接拒绝且不写入
+        stale_reasons: list[str] = []
+        if body.old_fingerprint != preview["old_fingerprint"]:
+            stale_reasons.append("document_changed")
+        if body.old_codings_fingerprint != preview["old_codings_fingerprint"]:
+            stale_reasons.append("codings_changed")
+        if stale_reasons:
             raise HTTPException(
-                status_code=422,
+                status_code=409,
                 detail={
-                    "message": "原文版本校验失败：文档在预检后已被修改，请重新生成迁移预览",
-                    "expected": current_fp,
+                    "message": "迁移预览已过期：预检后文档正文或标注已发生变化，"
+                    "正文与标注均未写入，请重新生成迁移预览",
+                    "stale": True,
+                    "stale_reasons": stale_reasons,
                 },
             )
 
+        blockers: list[dict] = []
         items_by_id = {it["coding_id"]: it for it in preview["items"]}
         pending_ids = {
             it["coding_id"] for it in preview["items"] if it["status"] in PENDING_STATUSES
